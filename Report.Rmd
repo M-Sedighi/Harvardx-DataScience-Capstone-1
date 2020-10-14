@@ -1,0 +1,334 @@
+---
+title: "Capstone Project 1: Movielens"
+author: "Majid Sedighi"
+date: "10/12/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 1- Introduction
+
+The main goal of this project is to create a movie recommendation system for the movielens dataset. This is similar to a competition held by Netflix where they challenge was to design an algorithm to accurately predict the ratings that users would give to movies based on the dataset provided by Netflix. To describe the goal of the project more specifically, first we need to get familiar with the dataset that is provided.
+
+
+The Movie lens dataset is a set of movie reviews collected and made available by GroupLens,  a research lab in the Department of Computer Science and Engineering at the University of Minnesota. The data sets were collected over various periods of time, and the complete latest version includes $27,000,000$ ratings for $58,000$ movies by $280,000$ users. The version that is used for this project is called movielens 10M, and it contains $10000054$ ratings applied to $10681$ movies by $71567$ users (according to documentation provided by GroupLens). Each user is represented by an id, and all users selected had rated at least $20$ movies. The main task for the algorithm designed in this project is to predict how a movie would be rated by a user based on the information available. The criteria for validating the achievement of this goal is the root-mean-square error (RMSE) between the predicted values and the observed values for ratings over a subset of data defined as the final validation set. The goal is to minimize this value using different methods and techniques taught throughout the course.
+
+
+The algorithm used in this project to achieve the said goal builds on top of the attempts made during the course. it relies on regularizing various predictors and combinations of them. Throughout the course, the best results were achieved when the average of all the ratings were used as the baseline value, and two regularized bias terms were added, first for each movie and then for each user. This study continues this approach further by adding two more bias terms for the genre of the movie and for the date that the review is written for each movie. These terms are explained further in the following sections.
+
+
+## 2- Analysis
+
+In this section the algorithm is described in detail.
+
+first, we need to acquire the data and perform the preprocessing steps to make it ready for the analysis. the script for the first part of this section is provided by the course, and it consists of downloading the database and splitting it to the training set and the hold-out final validation set. A point that has been considered in this part is to remove the entries in the validation set for the movies and users that do not have any data in the training set. These removed entries from the validation set are added back to the training set. Another point to consider is that the validation set defined here is only for the final test on the RMSE value, and it is not to be used during the development of the algorithm for purposes such as parameter tuning and tests.
+
+```{r acquiring the data, include=FALSE}
+# Note: this process could take a couple of minutes
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+if(!require(rmarkdown)) install.packages("rmarkdown", repos = "http://cran.us.r-project.org")
+
+library(tidyverse)
+library(caret)
+library(data.table)
+library(rmarkdown)
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+# if using R 4.0 or later:
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding") # if using R 3.5 or earlier, use `set.seed(1)`
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+
+```
+here are some of the characteristics of the training data set as defined by the script.
+
+\newpage
+
+```{r data summary, echo=FALSE}
+print("dimensions of edx")
+dim(edx)
+head(edx)
+
+print("dimensions of validation")
+dim(validation)
+head(validation)
+
+```
+
+As mentioned above, the final validation set cannot be used during the analysis, therefore the Edx set needs to be split again to training and test set. However, before splitting the data another additional step is necessary for the analysis. The dates of review submissions is included in the data set as "timestamp", with values being the time passed since January 1, 1970 in seconds. We need the dates in the actual year of the review. Therefore we add a column to both Edx and validation called "date", where we calculate the year that the review was written. 
+
+```{r adding date column, echo=TRUE}
+org <- as.Date('1970-1-1')
+set <- edx %>% mutate(date = as.Date(timestamp/86400,org)) %>% 
+  mutate(date=format(date, format="%Y"))
+holdout <- validation %>% mutate(date = as.Date(timestamp/86400,org)) %>%
+  mutate(date=format(date, format="%Y"))
+```
+
+Which results in our dataset mutating into this format: 
+
+```{r date added, echo=FALSE}
+head(set)
+```
+Now we split the Edx again into training and test set for optimizing  the hyper parameters, specifically the Lambda parameter for regularization. We choose the same proportion of data for the test set as the first split.
+
+```{r the second split}
+set.seed(2, sample.kind="Rounding")
+test_index <- createDataPartition(y = set$rating, times = 1, p = 0.1, list = FALSE)
+train_set <- set[-test_index,]
+temp <- set[test_index,]
+
+# Make sure userId and movieId in test set are also in training set
+test_set <- temp %>% 
+  semi_join(train_set, by = "movieId") %>%
+  semi_join(train_set, by = "userId")
+
+# Add rows removed from test set back into training set
+removed <- anti_join(temp, test_set)
+train_set <- rbind(train_set, removed)
+```
+
+
+The model chosen for the calculation is as follows:
+
+$$ Y_{u, i} = \mu + b_i + b_u + b_g + b_{d,i} + \epsilon_{u, i} $$
+
+
+
+where $Y_{u, i}$ is the predicted rating for user $u$ and movie $i$,
+
+$\mu$ is the average of all ratings across all movies and users,
+
+$b_i$ is the regularized bias term for each movie,
+
+$b_u$ is the regularized bias term for each user,
+
+$b_g$ is the regularized bias term for each group of genres,
+
+$b_{d,i}$ is the bias term for the date of the review in year $d$ for movie $i$,
+
+and $\epsilon_{u, i}$ is the error for user $u$ and movie $i$.
+
+
+Each bias term is regularized by the factor of $\lambda$, following this equation:
+
+$$ \hat{b}_{i}(\lambda) = \frac{1}{\lambda+n_i}\sum_{u=1}^{n_i}(Y_{u, i} - \hat{\mu}) $$
+where $n_i$ is a number of ratings $b$ for movie $i$.
+
+
+The process for calculation of each term is described here. The code in this section is for demonstration purpose and is not evaluated. An important point to consider when making the calculations is that when splitting the data we made sure the there are no movies nor users in the validation and test set that are not represented in the training set. However, we did not make sure that every unique group of genres and every combination of movie and review date in validation and test set are also represented in the training set. This can result in bias terms that are not calculated from the training set and are needed for making the predictions on validation and test set. In order to avoid producing NAs we consider these biases to be zero when making predictions. This is a logical assumption, since it makes sense to consider that the predictors for which we have no entries in the training set have no effect on our prediction. 
+
+
+
+The bias terms that have been used in the course already are calculated in the same manner as was in the course:
+
+```{r eval=FALSE, echo=TRUE}
+mu <- mean(train_set$rating)
+b_i <- train_set %>% group_by(movieId) %>% summarize(b_i = sum(rating - mu)/(n()+l)) 
+b_u <- train_set %>% group_by(userId) %>% summarize(b_u = sum(rating - b_i - mu)/(n()+l)) 
+
+```
+
+
+The new bias terms $b_g$ and $b_{d,i}$ are an attempt to expand on the context of the course to achieve better accuracy. Here is a brief explanation on how each are calculated. 
+
+The dataset provided includes the column `r colnames(edx)[6]`, where each movie has been indicated with multiple genres. there are `r length(unique(edx$genres))` unique combinations of genres present in the edx dataset. we define a regularized bias term for each of these values using the following code:
+
+```{r eval=FALSE, echo=TRUE}
+b_g <- train_set %>% group_by(genres) %>% 
+  summarize(b_g =sum(rating - b_i - b_u - mu)/(n()+l))
+```
+
+Note that the $b_i$, $b_u$, and $\mu$ values have to be subtracted beforehand, since we would have them calculated before hand.
+
+The last bias term $b_{d,i}$, uses the `r colnames(set)[7]` column that was created before, where we have the date of the reviews in year. The goal here is to calculate the bias term for each movie as well as the year that the review was written, therefore we need two levels of grouping the data, and this code will provide it:
+
+```{r eval=FALSE, echo=TRUE}
+b_d_i <- train_set %>% group_by(movieId,date) %>% 
+  summarize(b_d_i =sum(rating - b_i - b_u - b_g - mu)/(n()+l))
+```
+
+Once we have all of the bias terms calculate, we need to add them to the test set in their corresponding positions to be able to predict the ratings for the entries in that set.
+
+```{r eval=FALSE, echo=TRUE}
+prediction <- test_set %>% 
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    left_join(b_g, by = "genres") %>%
+    left_join(b_d_i, by = c("movieId"="movieId","date"="date"))
+```
+As mentioned before, the calculation of $b_{d,i}$ in this manner can result in NAs. Therefore we add this line to be able to get a prediction for such values.
+```{r eval=FALSE, echo=TRUE}
+prediction$b_d_i[is.na(prediction$b_d_i)] <- 0
+```
+
+Note that it is technically possible to also get NAs for $b_g$ on the prediction set. However, in practice this does not happen, and the code is not included in order to accelerate the calculations.
+
+Now we can make predictions by simply adding the terms in the equation:
+
+```{r eval=FALSE, echo=TRUE}
+predicted_ratings <- prediction %>% mutate(pred = mu + b_i + b_u + b_g + b_d_i) %>% .$pred
+```
+
+
+Finally, we can estimate the accuracy of our model using the $RMSE$ metric. This value is calculated as below:
+
+$$ RMSE = \sqrt{ \frac{1}{N} \sum_{u, i} ( \hat{y}_{u, i} - y_{u, i} )^2} $$
+
+Where $N$ is the number of entries, and $\hat{y}_{u, i}$ and $y_{u, i} )^2$ are the predicted and the real values of the ratings, respectively.
+
+For this algorithm, we define a function to handle the calculation of RMSE:
+
+```{r RMSE function, echo=TRUE}
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))}
+```
+
+
+In practice, we would like to run this model multiple times in order to fine tune the algorithm for the value of $\lambda$. Therefore we define a function to calculate the $RMSE$ given with $\lambda$ as input:
+
+
+```{r model function, echo=TRUE}
+model <- function(l){
+  mu <- mean(train_set$rating) 
+  b_i <- train_set %>% group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+l))
+  ts <- train_set %>% left_join(b_i, by="movieId") 
+  b_u <- ts %>% group_by(userId) %>% summarize(b_u = sum(rating - b_i - mu)/(n()+l))
+  ts <- ts %>% left_join(b_u, by = "userId") 
+  b_g <- ts %>% group_by(genres) %>% summarize(b_g =sum(rating - b_i - b_u - mu)/(n()+l))
+  ts <- ts %>% left_join(b_g, by = "genres") 
+  b_d_i <- ts %>% group_by(movieId,date) %>% 
+    summarize(b_d_i =sum(rating - b_i - b_u - b_g - mu)/(n()+l))
+  
+  prediction <- test_set %>% 
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    left_join(b_g, by = "genres") %>%
+    left_join(b_d_i, by = c("movieId"="movieId","date"="date"))
+  
+  prediction$b_d_i[is.na(prediction$b_d_i)] <- 0
+  predicted_ratings <- prediction %>% 
+    mutate(pred = mu + b_i + b_u + b_g + b_d_i) %>% .$pred
+  return(RMSE(predicted_ratings, test_set$rating))
+}
+
+```
+
+
+## 3- Results
+
+In this section we run our calculations by feeding the datasets to thhe functions we defined in the last section in order to find the optimal $\lambda$ for this dataset. In this stage of the calculation, we are not using the final validation set, therefore we carry out using the training and test set that was the result of the splitting of edx set.
+
+for each value of $\lambda$, the bias terms are calculated and the $RMSE$ for the test set (not to be confused the final validation set) is saved in a vector. For this algorithm we first run the function over a sequence of integers between 1 to 10, to get rough estimation of the optimized $\lambda$ parameter. Then we run it again around the integer with the minimum $RMSE$ to fine tune the $\lambda$ parameter with a margin of 0.1. 
+
+```{r first stage lambda, echo=TRUE}
+lambdas <- seq(1, 10, 1)
+```
+The first stage of calculation shows the following results:
+
+```{r first stage run, include=FALSE}
+rmses <- sapply(lambdas, model)
+
+```
+
+```{r first stage results}
+result <- data.frame(Lambda=lambdas, RMSE=rmses)
+print(result)
+
+lambda <- lambdas[which.min(rmses)]
+lambda
+min(rmses)
+plot(result)
+```
+
+now that we found the `r lambda` to result the lowest $RMSE$, we run another calculation around this value with more precision:
+```{r second stage lambda}
+
+lambdas <- seq(lambda-0.9, lambda+0.9, 0.1)
+
+
+```
+
+```{r second stage run, include=FALSE}
+rmses <- sapply(lambdas, model)
+```
+
+```{r second stage results}
+result <- data.frame(Lambda=lambdas, RMSE=rmses)
+print(result)
+plot(result)
+lambda <- lambdas[which.min(rmses)]
+lambda
+min(rmses)
+```
+
+Based on the second stage, we find the `r lambda` to be the best value for this dataset. Now we can train for the whole edx dataset and test on our final validation set to acquire our final result for $RMSE$.
+
+```{r final validation run, include=FALSE}
+train_set <- set
+test_set <- holdout
+
+final_RMSE <- model(lambda)
+
+```
+
+```{r reporting the final result}
+final_RMSE
+```
+
+The final result for $RMSE$ is `r final_RMSE`, which is below the value that was the goal given by the assignement.
+
+
+## 4- Conclusion
+
+In this study, an attempt was made to expand on the analysis that was carried out during the course by the means of adding two more bias terms for date of review and genre of the movies. Although these terms improved the accuracy of predictions and achieved the goal for the value of the $RMSE$, this is not in any way a complete approach for analyzing this data. In the following, some means to improve this results is discussed.
+
+An essential characteristic of such data is the interaction between the users. Users that have similar taste in movies tend to rate movies similarly. A good approach would be to find similar users to each user (using correlation matrix or any other metric), and consider how they rated a movie for making prediction. This approach was tested for this study but did not yield good results. This could be due to the limited number of entries in the dataset, since for every prediction there was very few similar user ratings available, if any. This approach could work for a much larger dataset, if the speed of calculations is not an issue (calculating all the correlations and creating similar user data for each user is computationally expensive). Same correlations can be studied between movies to explore similariies between movies.
+
+In order to improve the results given here an approach could be to include the date of review in months of year instead of only year used in this study. This could pick up a more precise temporal effect for reviews and improve accuracy. Again due to the limitations of the dataset size this approach will result in a significant number of NAs in the prediction of the corresponding bias term, and in result defeats the purpose.
+
+
+```{r save report, include=FALSE}
+rmarkdown::render("Report.R", "pdf_document")
+```
+
+
